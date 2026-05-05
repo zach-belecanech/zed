@@ -198,6 +198,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_merge_conflict_indicator: Option<bool>,
+    /// Whether to enable automatic and manual context compaction for agent threads.
+    ///
+    /// Default: true
+    pub compaction_enabled: Option<bool>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

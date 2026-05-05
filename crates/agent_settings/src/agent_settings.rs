@@ -625,6 +625,10 @@ pub fn normalize_path(raw: &str) -> String {
     }
 }
 
+fn default_compaction_enabled() -> bool {
+    true
+}
+
 impl Settings for AgentSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let agent = content.agent.clone().unwrap();
@@ -671,7 +675,9 @@ impl Settings for AgentSettings {
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
-            compaction_enabled: true,
+            compaction_enabled: agent
+                .compaction_enabled
+                .unwrap_or_else(default_compaction_enabled),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
         }
     }

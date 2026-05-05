@@ -954,4 +954,46 @@ mod tests {
         assert_eq!(scroll.item_ix, 42);
         assert!((scroll.offset_in_item - 13.5).abs() < f32::EPSILON);
     }
+
+    #[gpui::test]
+    async fn test_compaction_roundtrips_through_save_load(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let thread_id = session_id("thread-with-compaction");
+        let mut thread = make_thread(
+            "Compacted Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.compaction = Some(crate::CompactionState {
+            summary: "Saved summary".into(),
+            compacted_through_ix: 3,
+            metadata: crate::CompactionMetadata {
+                mode: crate::SummaryMode::Simple,
+                source: crate::CompactionSource::Background,
+                num_messages_summarized: 4,
+                token_usage_before: 512,
+            },
+        });
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id)
+            .await
+            .unwrap()
+            .expect("thread should exist");
+
+        let compaction = loaded.compaction.expect("compaction should be restored");
+        assert_eq!(compaction.summary, "Saved summary");
+        assert_eq!(compaction.compacted_through_ix, 3);
+        assert_eq!(compaction.metadata.num_messages_summarized, 4);
+        assert_eq!(compaction.metadata.token_usage_before, 512);
+        assert!(matches!(
+            compaction.metadata.source,
+            crate::CompactionSource::Background
+        ));
+    }
 }

@@ -7696,6 +7696,24 @@ fn ai_page(cx: &App) -> SettingsPage {
                 metadata: None,
                 files: USER,
             }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Context Compaction",
+                description: "Whether to enable automatic and manual context compaction for agent threads.",
+                field: Box::new(SettingField {
+                    json_path: Some("agent.compaction_enabled"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.compaction_enabled.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .compaction_enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
         ]);
 
         items.into_boxed_slice()

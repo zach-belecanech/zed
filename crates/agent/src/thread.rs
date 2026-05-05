@@ -1259,6 +1259,15 @@ impl Thread {
         cx.notify();
     }
 
+    fn apply_ready_background_compaction(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(state) = self.consume_background_summary() {
+            self.apply_compaction(state, cx);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn consume_background_summary(&mut self) -> Option<crate::CompactionState> {
         match std::mem::replace(&mut self.background_summarizer, BackgroundSummarizerState::Idle) {
             BackgroundSummarizerState::Completed {
@@ -2361,23 +2370,7 @@ impl Thread {
             }
 
             if max_tokens_hit {
-                if let Some(state) = this.update(cx, |this, _| this.consume_background_summary())? {
-                    this.update(cx, |this, cx| this.apply_compaction(state, cx))?;
-                    continue;
-                }
-
-                if let Some(through_ix) =
-                    this.update(cx, |this, _| this.select_summarization_point())?
-                {
-                    let task = this.update(cx, |this, cx| {
-                        this.run_compaction(through_ix, crate::CompactionSource::Foreground, None, cx)
-                    })?;
-                    task.await;
-                    if let Some(state) =
-                        this.update(cx, |this, _| this.consume_background_summary())?
-                    {
-                        this.update(cx, |this, cx| this.apply_compaction(state, cx))?;
-                    }
+                if Self::recover_from_max_tokens(this, cx).await? {
                     continue;
                 }
 
@@ -2421,6 +2414,25 @@ impl Thread {
                 attempt = 0;
             }
         }
+    }
+
+    async fn recover_from_max_tokens(
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncApp,
+    ) -> Result<bool> {
+        if this.update(cx, |this, cx| this.apply_ready_background_compaction(cx))? {
+            return Ok(true);
+        }
+
+        if let Some(through_ix) = this.update(cx, |this, _| this.select_summarization_point())? {
+            let task = this.update(cx, |this, cx| {
+                this.run_compaction(through_ix, crate::CompactionSource::Foreground, None, cx)
+            })?;
+            task.await;
+            return Ok(this.update(cx, |this, cx| this.apply_ready_background_compaction(cx))?);
+        }
+
+        Ok(false)
     }
 
     fn process_tool_result(
@@ -4898,6 +4910,153 @@ mod tests {
 
                 match &last_message.content[0] {
                     AgentMessageContent::ToolUse(tool_use) => {
+
+    #[gpui::test]
+    async fn test_build_request_messages_uses_compaction_summary_and_recent_messages(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _cx| {
+                thread.messages = vec![
+                    Message::User(UserMessage {
+                        id: UserMessageId::new(),
+                        content: vec![UserMessageContent::Text("old question".into())],
+                    }),
+                    Message::Agent(AgentMessage {
+                        content: vec![AgentMessageContent::Text("old answer".into())],
+                        ..Default::default()
+                    }),
+                    Message::User(UserMessage {
+                        id: UserMessageId::new(),
+                        content: vec![UserMessageContent::Text("new question".into())],
+                    }),
+                ];
+                thread.compaction = Some(crate::CompactionState {
+                    summary: "Condensed history".into(),
+                    compacted_through_ix: 1,
+                    metadata: crate::CompactionMetadata {
+                        mode: crate::SummaryMode::Simple,
+                        source: crate::CompactionSource::Background,
+                        num_messages_summarized: 2,
+                        token_usage_before: 128,
+                    },
+                });
+            });
+        });
+
+        let request_messages = cx.update(|cx| thread.read(cx).build_request_messages(Vec::new(), cx));
+
+        assert_eq!(request_messages.len(), 3);
+        assert_eq!(request_messages[1].role, Role::User);
+        assert_eq!(
+            request_messages[1].string_contents(),
+            "<conversation-summary>\nCondensed history\n</conversation-summary>"
+        );
+
+        let combined = request_messages
+            .iter()
+            .map(|message| message.string_contents())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!combined.contains("old question"));
+        assert!(!combined.contains("old answer"));
+        assert!(combined.contains("new question"));
+    }
+
+    #[gpui::test]
+    async fn test_recover_from_max_tokens_consumes_completed_background_summary(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _cx| {
+                thread.background_summarizer = BackgroundSummarizerState::Completed {
+                    summary: "Recovered summary".into(),
+                    summarize_through_ix: 0,
+                    metadata: crate::CompactionMetadata {
+                        mode: crate::SummaryMode::Simple,
+                        source: crate::CompactionSource::Background,
+                        num_messages_summarized: 1,
+                        token_usage_before: 42,
+                    },
+                };
+            });
+        });
+
+        let recovered = {
+            let mut async_cx = cx.to_async();
+            Thread::recover_from_max_tokens(&thread.downgrade(), &mut async_cx)
+                .await
+                .unwrap()
+        };
+
+        assert!(recovered);
+
+        cx.update(|cx| {
+            let thread = thread.read(cx);
+            let compaction = thread.compaction.as_ref().expect("compaction should be applied");
+            assert_eq!(compaction.summary, "Recovered summary");
+            assert_eq!(compaction.compacted_through_ix, 0);
+            assert!(matches!(thread.background_summarizer, BackgroundSummarizerState::Idle));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_run_compaction_stores_completed_summary(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let fake_model = Arc::new(FakeLanguageModel::default());
+        let model: Arc<dyn LanguageModel> = fake_model.clone();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.messages = vec![
+                    Message::User(UserMessage {
+                        id: UserMessageId::new(),
+                        content: vec![UserMessageContent::Text("first question".into())],
+                    }),
+                    Message::Agent(AgentMessage {
+                        content: vec![AgentMessageContent::Text("first answer".into())],
+                        ..Default::default()
+                    }),
+                ];
+                thread.set_model(model, cx);
+            });
+        });
+
+        let task = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.run_compaction(1, crate::CompactionSource::Foreground, None, cx)
+            })
+        });
+
+        cx.run_until_parked();
+        let request = fake_model
+            .pending_completions()
+            .pop()
+            .expect("compaction request should be pending");
+        fake_model.send_completion_stream_text_chunk(&request, "<summary>Foreground summary</summary>");
+        fake_model.end_completion_stream(&request);
+
+        let summary = task.await;
+        assert_eq!(summary.as_deref(), Some("Foreground summary"));
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _cx| {
+                let compaction = thread
+                    .consume_background_summary()
+                    .expect("background summary should be available");
+                assert_eq!(compaction.summary, "Foreground summary");
+                assert_eq!(compaction.compacted_through_ix, 1);
+                assert!(matches!(
+                    compaction.metadata.source,
+                    crate::CompactionSource::Foreground
+                ));
+            });
+        });
+    }
                         assert_eq!(tool_use.id, tool_use_id);
                         assert_eq!(tool_use.name, tool_name);
                         assert_eq!(tool_use.raw_input, raw_input.to_string());
