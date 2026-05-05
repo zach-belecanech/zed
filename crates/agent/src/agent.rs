@@ -6,12 +6,14 @@ mod pattern_extraction;
 mod templates;
 #[cfg(test)]
 mod tests;
+mod compaction;
 mod thread;
 mod thread_store;
 mod tool_permissions;
 mod tools;
 
 use context_server::ContextServerId;
+pub use compaction::{CompactionSource, CompactionState, CompactionMetadata, SummaryMode};
 pub use db::*;
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
@@ -1598,6 +1600,27 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         };
 
         if let Some(parsed_command) = Command::parse(&params.prompt) {
+            if parsed_command.prompt_name == "compact" {
+                let instructions = if parsed_command.arg_value.trim().is_empty() {
+                    None
+                } else {
+                    Some(parsed_command.arg_value.trim().to_string())
+                };
+                if let Some(thread) = self.thread(&session_id, cx) {
+                    let _ = thread.update(cx, |thread, cx| {
+                        if let Some(ix) = thread.select_summarization_point() {
+                            let _ = thread.run_compaction(
+                                ix,
+                                crate::CompactionSource::Manual,
+                                instructions,
+                                cx,
+                            );
+                        }
+                    });
+                }
+                return Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)));
+            }
+
             let registry = project_state.context_server_registry.read(cx);
 
             let explicit_server_id = parsed_command

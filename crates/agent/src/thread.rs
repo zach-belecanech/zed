@@ -13,7 +13,8 @@ use feature_flags::{FeatureFlagAppExt as _, LspToolFeatureFlag, UpdatePlanToolFe
 
 use agent_client_protocol::schema as acp;
 use agent_settings::{
-    AgentProfileId, AgentSettings, SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT,
+    AgentProfileId, AgentSettings, COMPACT_CONTEXT_PROMPT, SUMMARIZE_THREAD_DETAILED_PROMPT,
+    SUMMARIZE_THREAD_PROMPT,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -936,6 +937,111 @@ enum CompletionError {
     Other(#[from] anyhow::Error),
 }
 
+pub enum BackgroundSummarizerState {
+    Idle,
+    InProgress {
+        task: Shared<Task<Option<String>>>,
+        summarize_through_ix: usize,
+    },
+    Completed {
+        summary: String,
+        summarize_through_ix: usize,
+        metadata: crate::CompactionMetadata,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+impl Default for BackgroundSummarizerState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+pub struct SummarizationThresholds {
+    pub warm_jitter_min: f64,
+    pub warm_jitter_span: f64,
+    pub emergency: f64,
+}
+
+impl Default for SummarizationThresholds {
+    fn default() -> Self {
+        Self {
+            warm_jitter_min: 0.78,
+            warm_jitter_span: 0.04,
+            emergency: 0.90,
+        }
+    }
+}
+
+fn compute_input_budget(model: &dyn LanguageModel) -> u64 {
+    let total = model.max_token_count();
+    let output_reserve = model.max_output_tokens().unwrap_or(total / 4);
+    total.saturating_sub(output_reserve)
+}
+
+fn should_compact(ratio: f64, warm: bool, thresholds: &SummarizationThresholds) -> bool {
+    if warm {
+        ratio >= thresholds.warm_jitter_min
+    } else {
+        ratio >= thresholds.emergency
+    }
+}
+
+fn extract_summary(response: &str) -> String {
+    if let Some(start) = response.find("<summary>")
+        && let Some(end) = response.find("</summary>")
+    {
+        return response[start + "<summary>".len()..end].trim().to_string();
+    }
+    response.trim().to_string()
+}
+
+fn render_text_history(messages: &[Message]) -> String {
+    let mut output = String::new();
+    for (ix, msg) in messages.iter().enumerate() {
+        match msg {
+            Message::User(user_msg) => {
+                output.push_str(&format!("\n## User Message {}\n", ix));
+                for content in &user_msg.content {
+                    if let UserMessageContent::Text(text) = content {
+                        output.push_str(text);
+                    }
+                }
+            }
+            Message::Agent(agent_msg) => {
+                output.push_str(&format!("\n## Agent Response {}\n", ix));
+                for content in &agent_msg.content {
+                    match content {
+                        AgentMessageContent::Text(text) => output.push_str(text),
+                        AgentMessageContent::ToolUse(tool) => {
+                            output.push_str(&format!("\n[Tool: {} ({})]\n", tool.name, tool.id));
+                            let input: String = tool.raw_input.chars().take(500).collect();
+                            output.push_str(&input);
+                        }
+                        _ => {}
+                    }
+                }
+                for (id, result) in &agent_msg.tool_results {
+                    output.push_str(&format!("\n[Result: {} ({})]\n", result.tool_name, id));
+                    for content in &result.content {
+                        let s = match content {
+                            LanguageModelToolResultContent::Text(t) => {
+                                t.chars().take(1000).collect::<String>()
+                            }
+                            _ => String::new(),
+                        };
+                        output.push_str(&s);
+                    }
+                }
+            }
+            Message::Resume => output.push_str("\n[Conversation resumed]\n"),
+        }
+    }
+    output
+}
+
 pub struct Thread {
     id: acp::SessionId,
     prompt_id: PromptId,
@@ -983,6 +1089,10 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    /// Active compaction state — older messages replaced by summary when Some
+    compaction: Option<crate::CompactionState>,
+    background_summarizer: BackgroundSummarizerState,
+    summarization_thresholds: SummarizationThresholds,
 }
 
 impl Thread {
@@ -1104,6 +1214,9 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+            compaction: None,
+            background_summarizer: BackgroundSummarizerState::Idle,
+            summarization_thresholds: SummarizationThresholds::default(),
         }
     }
 
@@ -1118,6 +1231,156 @@ impl Thread {
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
         self.profile_id = parent.profile_id.clone();
+    }
+
+    /// Select the message index to summarize through.
+    /// Returns the index of the second-to-last Agent message.
+    pub(crate) fn select_summarization_point(&self) -> Option<usize> {
+        let agent_indices: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, Message::Agent(_)))
+            .map(|(ix, _)| ix)
+            .collect();
+
+        if agent_indices.len() >= 2 {
+            Some(agent_indices[agent_indices.len() - 2])
+        } else if agent_indices.len() == 1 && self.messages.len() > 2 {
+            Some(agent_indices[0])
+        } else {
+            None
+        }
+    }
+
+    pub fn apply_compaction(&mut self, state: crate::CompactionState, cx: &mut Context<Self>) {
+        self.compaction = Some(state);
+        self.background_summarizer = BackgroundSummarizerState::Idle;
+        cx.notify();
+    }
+
+    pub fn consume_background_summary(&mut self) -> Option<crate::CompactionState> {
+        match std::mem::replace(&mut self.background_summarizer, BackgroundSummarizerState::Idle) {
+            BackgroundSummarizerState::Completed {
+                summary,
+                summarize_through_ix,
+                metadata,
+            } => Some(crate::CompactionState {
+                summary,
+                compacted_through_ix: summarize_through_ix,
+                metadata,
+            }),
+            other => {
+                self.background_summarizer = other;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn run_compaction(
+        &mut self,
+        summarize_through_ix: usize,
+        source: crate::CompactionSource,
+        custom_instructions: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Shared<Task<Option<String>>> {
+        let model = self
+            .summarization_model
+            .clone()
+            .or_else(|| self.model.clone());
+        let Some(model) = model else {
+            return Task::ready(None).shared();
+        };
+
+        if self.messages.is_empty() {
+            return Task::ready(None).shared();
+        }
+
+        let bounded_ix = summarize_through_ix.min(self.messages.len().saturating_sub(1));
+        let messages_snapshot: Vec<Message> = self.messages[..=bounded_ix].to_vec();
+        let num_messages = messages_snapshot.len();
+
+        let mut system_prompt = COMPACT_CONTEXT_PROMPT.to_string();
+        if let Some(instructions) = custom_instructions {
+            system_prompt.push_str(&format!("\n\n## Additional instructions:\n{}", instructions));
+        }
+        system_prompt.push_str("\nIMPORTANT: Do NOT call any tools. Generate a text summary only.");
+
+        let history = render_text_history(&messages_snapshot);
+        let request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![system_prompt.into()],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![history.into()],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+
+        let task = cx
+            .spawn(async move |this, cx| {
+                let stream = model.stream_completion(request, cx).await;
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("Compaction failed: {e}");
+                        this.update(cx, |this, _| {
+                            this.background_summarizer = BackgroundSummarizerState::Failed {
+                                error: e.to_string(),
+                            };
+                        })
+                        .ok();
+                        return None;
+                    }
+                };
+
+                let mut response = String::new();
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(LanguageModelCompletionEvent::Text(text)) => {
+                            response.push_str(&text);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::warn!("Compaction stream error: {e}");
+                            break;
+                        }
+                    }
+                }
+
+                let summary = extract_summary(&response);
+                this.update(cx, |this, cx| {
+                    this.background_summarizer = BackgroundSummarizerState::Completed {
+                        summary: summary.clone(),
+                        summarize_through_ix: bounded_ix,
+                        metadata: crate::CompactionMetadata {
+                            mode: crate::SummaryMode::Simple,
+                            source,
+                            num_messages_summarized: num_messages,
+                            token_usage_before: 0,
+                        },
+                    };
+                    cx.notify();
+                })
+                .ok();
+                Some(summary)
+            })
+            .shared();
+
+        self.background_summarizer = BackgroundSummarizerState::InProgress {
+            task: task.clone(),
+            summarize_through_ix: bounded_ix,
+        };
+        task
     }
 
     pub fn id(&self) -> &acp::SessionId {
@@ -1337,6 +1600,9 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+            compaction: db_thread.compaction,
+            background_summarizer: BackgroundSummarizerState::Idle,
+            summarization_thresholds: SummarizationThresholds::default(),
         }
     }
 
@@ -1367,6 +1633,7 @@ impl Thread {
                     offset_in_item: lo.offset_in_item.as_f32(),
                 }
             }),
+            compaction: self.compaction.clone(),
         };
 
         cx.background_spawn(async move {
@@ -1956,6 +2223,7 @@ impl Thread {
                 FuturesUnordered::new();
             let mut early_tool_results: Vec<LanguageModelToolResult> = Vec::new();
             let mut cancelled = false;
+            let mut max_tokens_hit = false;
             loop {
                 // Race between getting the first event, tool completion, and cancellation.
                 let first_event = futures::select! {
@@ -2037,8 +2305,17 @@ impl Thread {
 
                 tool_results.extend(batch_result.0);
                 if let Some(err) = batch_result.1 {
-                    error = Some(err.downcast()?);
-                    break;
+                    match err.downcast::<CompletionError>() {
+                        Ok(CompletionError::MaxTokens) => {
+                            max_tokens_hit = true;
+                            break;
+                        }
+                        Ok(other) => return Err(other.into()),
+                        Err(err) => {
+                            error = Some(err.downcast()?);
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -2081,6 +2358,30 @@ impl Thread {
             if cancelled {
                 log::debug!("Turn cancelled by user, exiting");
                 return Ok(());
+            }
+
+            if max_tokens_hit {
+                if let Some(state) = this.update(cx, |this, _| this.consume_background_summary())? {
+                    this.update(cx, |this, cx| this.apply_compaction(state, cx))?;
+                    continue;
+                }
+
+                if let Some(through_ix) =
+                    this.update(cx, |this, _| this.select_summarization_point())?
+                {
+                    let task = this.update(cx, |this, cx| {
+                        this.run_compaction(through_ix, crate::CompactionSource::Foreground, None, cx)
+                    })?;
+                    task.await;
+                    if let Some(state) =
+                        this.update(cx, |this, _| this.consume_background_summary())?
+                    {
+                        this.update(cx, |this, cx| this.apply_compaction(state, cx))?;
+                    }
+                    continue;
+                }
+
+                return Err(CompletionError::MaxTokens.into());
             }
 
             if let Some(error) = error {
@@ -2268,6 +2569,26 @@ impl Thread {
                     cache_read_input_tokens = usage.cache_read_input_tokens,
                 );
                 self.update_token_usage(usage, cx);
+                if AgentSettings::get_global(cx).compaction_enabled
+                    && matches!(self.background_summarizer, BackgroundSummarizerState::Idle)
+                {
+                    if let Some(model) = &self.model {
+                        let budget = compute_input_budget(model.as_ref());
+                        if budget > 0 {
+                            let ratio = usage.input_tokens as f64 / budget as f64;
+                            if should_compact(ratio, true, &self.summarization_thresholds)
+                                && let Some(ix) = self.select_summarization_point()
+                            {
+                                let _ = self.run_compaction(
+                                    ix,
+                                    crate::CompactionSource::Background,
+                                    None,
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),
             Stop(StopReason::MaxTokens) => return Err(CompletionError::MaxTokens.into()),
@@ -3024,8 +3345,25 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
-        for message in &self.messages {
-            messages.extend(message.to_request());
+        if let Some(compaction) = &self.compaction {
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![format!(
+                    "<conversation-summary>\n{}\n</conversation-summary>",
+                    compaction.summary
+                )
+                .into()],
+                cache: false,
+                reasoning_details: None,
+            });
+            let start = (compaction.compacted_through_ix + 1).min(self.messages.len());
+            for message in &self.messages[start..] {
+                messages.extend(message.to_request());
+            }
+        } else {
+            for message in &self.messages {
+                messages.extend(message.to_request());
+            }
         }
 
         if let Some(last_message) = messages.last_mut() {
