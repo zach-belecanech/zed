@@ -1,6 +1,9 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     agent_configuration::configure_context_server_modal::default_markdown_style,
+    context_usage_indicator::{
+        ContextUsageIndicator, ContextUsageLevel, context_usage_percentage,
+    },
 };
 use agent_client_protocol::schema as acp;
 use std::cell::RefCell;
@@ -3482,7 +3485,7 @@ impl ThreadView {
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
-        let usage = thread.token_usage()?;
+        let usage = thread.token_usage()?.clone();
         let show_split = self.supports_split_token_display(cx);
 
         let cost_label = if cx.has_flag::<AcpBetaFeatureFlag>() {
@@ -3498,29 +3501,18 @@ impl ThreadView {
             None
         };
 
-        let progress_color = |ratio: f32| -> Hsla {
-            if ratio >= 0.85 {
-                cx.theme().status().warning
-            } else {
-                cx.theme().colors().text_muted
-            }
-        };
-
         let used = crate::humanize_token_count(usage.used_tokens);
         let max = crate::humanize_token_count(usage.max_tokens);
         let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
         let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
 
-        let progress_ratio = if usage.max_tokens > 0 {
-            usage.used_tokens as f32 / usage.max_tokens as f32
-        } else {
-            0.0
-        };
+        let usage_percentage = context_usage_percentage(&usage);
+        let usage_level = ContextUsageLevel::from_percentage(usage_percentage);
 
         let ring_size = px(16.0);
         let stroke_width = px(2.);
 
-        let percentage = format!("{}%", (progress_ratio * 100.0).round() as u32);
+        let percentage = format!("{}%", usage_percentage.round() as u32);
 
         let tooltip_separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
 
@@ -3556,6 +3548,8 @@ impl ThreadView {
         let input_max_label =
             crate::humanize_token_count(usage.max_tokens.saturating_sub(max_output_tokens));
         let output_max_label = crate::humanize_token_count(max_output_tokens);
+        let input_max_raw = usage.max_tokens.saturating_sub(max_output_tokens);
+        let output_max_raw = max_output_tokens;
 
         let build_tooltip = {
             move |_window: &mut Window, cx: &mut App| {
@@ -3577,6 +3571,7 @@ impl ThreadView {
                     output_tokens: output_tokens_label,
                     input_max: input_max_label,
                     output_max: output_max_label,
+                    level: usage_level,
                     show_split,
                     cost_label,
                     separator_color: tooltip_separator_color,
@@ -3590,88 +3585,30 @@ impl ThreadView {
             }
         };
 
-        if show_split {
-            let input_max_raw = usage.max_tokens.saturating_sub(max_output_tokens);
-            let output_max_raw = max_output_tokens;
-
-            let input_ratio = if input_max_raw > 0 {
-                usage.input_tokens as f32 / input_max_raw as f32
-            } else {
-                0.0
-            };
-            let output_ratio = if output_max_raw > 0 {
-                usage.output_tokens as f32 / output_max_raw as f32
-            } else {
-                0.0
-            };
-
-            Some(
-                h_flex()
-                    .id("split_token_usage")
-                    .flex_shrink_0()
-                    .gap_1p5()
-                    .mr_1()
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(
-                                Icon::new(IconName::ArrowUp)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                CircularProgress::new(
-                                    usage.input_tokens as f32,
-                                    input_max_raw as f32,
-                                    ring_size,
-                                    cx,
-                                )
-                                .stroke_width(stroke_width)
-                                .progress_color(progress_color(input_ratio)),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(
-                                Icon::new(IconName::ArrowDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                CircularProgress::new(
-                                    usage.output_tokens as f32,
-                                    output_max_raw as f32,
-                                    ring_size,
-                                    cx,
-                                )
-                                .stroke_width(stroke_width)
-                                .progress_color(progress_color(output_ratio)),
-                            ),
-                    )
-                    .hoverable_tooltip(build_tooltip)
-                    .into_any_element(),
-            )
+        let indicator = if show_split {
+            ContextUsageIndicator::new(usage)
+                .split_limits(input_max_raw, output_max_raw)
+                .size(ring_size)
+                .stroke_width(stroke_width)
         } else {
-            Some(
-                h_flex()
-                    .id("circular_progress_tokens")
-                    .mt_px()
-                    .mr_1()
-                    .child(
-                        CircularProgress::new(
-                            usage.used_tokens as f32,
-                            usage.max_tokens as f32,
-                            ring_size,
-                            cx,
-                        )
-                        .stroke_width(stroke_width)
-                        .progress_color(progress_color(progress_ratio)),
-                    )
-                    .hoverable_tooltip(build_tooltip)
-                    .into_any_element(),
-            )
-        }
+            ContextUsageIndicator::new(usage)
+                .size(ring_size)
+                .stroke_width(stroke_width)
+        };
+
+        Some(
+            h_flex()
+                .id(if show_split {
+                    "split_token_usage"
+                } else {
+                    "context_usage_indicator"
+                })
+                .flex_shrink_0()
+                .mr_1()
+                .child(indicator)
+                .hoverable_tooltip(build_tooltip)
+                .into_any_element(),
+        )
     }
 
     fn fast_mode_available(&self, cx: &Context<Self>) -> bool {
@@ -4254,6 +4191,7 @@ struct TokenUsageTooltip {
     output_tokens: String,
     input_max: String,
     output_max: String,
+    level: ContextUsageLevel,
     show_split: bool,
     cost_label: Option<String>,
     separator_color: Color,
@@ -4274,6 +4212,7 @@ impl Render for TokenUsageTooltip {
         let output_tokens = self.output_tokens.clone();
         let input_max = self.input_max.clone();
         let output_max = self.output_max.clone();
+        let level = self.level;
         let show_split = self.show_split;
         let cost_label = self.cost_label.clone();
         let user_rules_count = self.user_rules_count;
@@ -4290,20 +4229,26 @@ impl Render for TokenUsageTooltip {
                         .color(Color::Muted)
                         .size(LabelSize::Small),
                 )
-                .when(!show_split, |this| {
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(Label::new(percentage.clone()))
+                        .child(Label::new("\u{2022}").color(separator_color).mx_1())
+                        .child(Label::new(used.clone()))
+                        .child(Label::new("/").color(separator_color))
+                        .child(Label::new(max.clone()).color(Color::Muted)),
+                )
+                .when_some(level.warning_message(), |this, warning_message| {
                     this.child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(Label::new(percentage.clone()))
-                            .child(Label::new("\u{2022}").color(separator_color).mx_1())
-                            .child(Label::new(used.clone()))
-                            .child(Label::new("/").color(separator_color))
-                            .child(Label::new(max.clone()).color(Color::Muted)),
+                        Label::new(warning_message)
+                            .color(level.text_color())
+                            .size(LabelSize::Small),
                     )
                 })
                 .when(show_split, |this| {
                     this.child(
                         v_flex()
+                            .mt_1()
                             .gap_0p5()
                             .child(
                                 h_flex()
@@ -8775,24 +8720,36 @@ impl ThreadView {
             return None;
         }
 
-        let token_usage = self.thread.read(cx).token_usage()?;
-        let ratio = token_usage.ratio();
+        let token_usage = self.thread.read(cx).token_usage()?.clone();
+        let usage_level =
+            ContextUsageLevel::from_tokens(token_usage.used_tokens, token_usage.max_tokens);
+        let reached_limit =
+            token_usage.max_tokens > 0 && token_usage.used_tokens >= token_usage.max_tokens;
 
-        let (severity, icon, title) = match ratio {
-            acp_thread::TokenUsageRatio::Normal => return None,
-            acp_thread::TokenUsageRatio::Warning => (
-                Severity::Warning,
-                IconName::Warning,
-                "Thread reaching the token limit soon",
-            ),
-            acp_thread::TokenUsageRatio::Exceeded => (
+        let (severity, icon, title, description) = if reached_limit {
+            (
                 Severity::Error,
                 IconName::XCircle,
                 "Thread reached the token limit",
-            ),
+                "Start a new thread from a summary to continue.",
+            )
+        } else {
+            match usage_level {
+                ContextUsageLevel::Normal => return None,
+                ContextUsageLevel::Warning => (
+                    Severity::Warning,
+                    IconName::Warning,
+                    "Thread reaching the token limit soon",
+                    "Quality may decline as the context window fills. Start a new thread from a summary before the limit is reached.",
+                ),
+                ContextUsageLevel::Critical => (
+                    Severity::Error,
+                    IconName::Warning,
+                    "Thread is very close to the token limit",
+                    "Start a new thread from a summary to continue reliably.",
+                ),
+            }
         };
-
-        let description = "To continue, start a new thread from a summary.";
 
         Some(
             Callout::new()

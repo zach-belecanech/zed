@@ -8,6 +8,7 @@ mod buffer_codegen;
 mod completion_provider;
 mod config_options;
 mod context;
+mod context_usage_indicator;
 mod context_server_configuration;
 pub(crate) mod conversation_view;
 mod diagnostics;
