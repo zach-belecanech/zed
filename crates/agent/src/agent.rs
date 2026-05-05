@@ -29,6 +29,7 @@ use acp_thread::{
     AcpThread, AgentModelSelector, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
     AgentSessionListResponse, TokenUsageRatio, UserMessageId,
 };
+use agent_settings::AgentSettings;
 use agent_client_protocol::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -48,7 +49,7 @@ use prompt_store::{
     WorktreeContext,
 };
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelSelection, Settings as _, update_settings_file};
+use settings::{LanguageModelSelection, Settings as _, SettingsStore, update_settings_file};
 use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -282,6 +283,12 @@ impl NativeAgent {
                 &LanguageModelRegistry::global(cx),
                 Self::handle_models_updated_event,
             )];
+            subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+                let project_ids = this.projects.keys().copied().collect::<Vec<_>>();
+                for project_id in project_ids {
+                    this.update_available_commands_for_project(project_id, cx);
+                }
+            }));
             if let Some(prompt_store) = prompt_store.as_ref() {
                 subscriptions.push(cx.subscribe(prompt_store, Self::handle_prompts_updated_event))
             }
@@ -843,8 +850,21 @@ impl NativeAgent {
         project_state: Option<&ProjectState>,
         cx: &App,
     ) -> Vec<acp::AvailableCommand> {
+        let mut available_commands = Vec::new();
+
+        if AgentSettings::get_global(cx).compaction_enabled {
+            let compact_command = acp::AvailableCommand::new(
+                "compact",
+                "Summarize older thread context to reduce token usage.",
+            )
+            .input(acp::AvailableCommandInput::Unstructured(
+                acp::UnstructuredCommandInput::new("[instructions]"),
+            ));
+            available_commands.push(compact_command);
+        }
+
         let Some(state) = project_state else {
-            return vec![];
+            return available_commands;
         };
         let registry = state.context_server_registry.read(cx);
 
@@ -855,9 +875,7 @@ impl NativeAgent {
                 .or_insert(0) += 1;
         }
 
-        registry
-            .prompts()
-            .flat_map(|context_server_prompt| {
+        available_commands.extend(registry.prompts().flat_map(|context_server_prompt| {
                 let prompt = &context_server_prompt.prompt;
 
                 let should_prefix = prompt_name_counts
@@ -893,8 +911,9 @@ impl NativeAgent {
                 }
 
                 Some(command)
-            })
-            .collect()
+            }));
+
+        available_commands
     }
 
     pub fn load_thread(
@@ -1601,6 +1620,12 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
         if let Some(parsed_command) = Command::parse(&params.prompt) {
             if parsed_command.prompt_name == "compact" {
+                if !AgentSettings::get_global(cx).compaction_enabled {
+                    return Task::ready(Err(anyhow!(
+                        "The /compact command is disabled because agent.compaction_enabled is false."
+                    )));
+                }
+
                 let instructions = if parsed_command.arg_value.trim().is_empty() {
                     None
                 } else {
@@ -2594,6 +2619,38 @@ mod internal_tests {
                 );
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_new_sessions_advertise_compact_command(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), None, fs.clone(), cx));
+        let connection = NativeAgentConnection(agent);
+
+        let acp_thread = cx
+            .update(|cx| {
+                Rc::new(connection).new_session(project, PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let available_commands = cx.read(|cx| acp_thread.read(cx).available_commands().to_vec());
+
+        let compact_command = available_commands
+            .iter()
+            .find(|command| command.name.as_str() == "compact")
+            .expect("native sessions should advertise /compact");
+        assert_eq!(
+            compact_command.description.as_str(),
+            "Summarize older thread context to reduce token usage."
+        );
+        assert!(compact_command.input.is_some());
     }
 
     #[gpui::test]
