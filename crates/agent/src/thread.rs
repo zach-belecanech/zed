@@ -1386,7 +1386,7 @@ impl Thread {
                     reasoning_details: None,
                 },
             ],
-            temperature: Some(0.0),
+            temperature: AgentSettings::temperature_for_model(&model, cx),
             ..Default::default()
         };
 
@@ -5092,6 +5092,7 @@ mod tests {
             .pending_completions()
             .pop()
             .expect("compaction request should be pending");
+        assert_eq!(request.temperature, None);
         fake_model.send_completion_stream_text_chunk(&request, "<summary>Foreground summary</summary>");
         fake_model.end_completion_stream(&request);
 
