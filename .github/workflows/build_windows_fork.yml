@@ -1,0 +1,35 @@
+name: Build Windows (fork)
+on:
+  push:
+    branches:
+      - feature/agent-context-compaction
+  workflow_dispatch:
+
+jobs:
+  build_windows_x86_64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release -p zed
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-x86_64.exe
+          path: target/release/zed.exe
+          if-no-files-found: error
