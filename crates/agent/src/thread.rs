@@ -1256,7 +1256,19 @@ impl Thread {
     pub fn apply_compaction(&mut self, state: crate::CompactionState, cx: &mut Context<Self>) {
         self.compaction = Some(state);
         self.background_summarizer = BackgroundSummarizerState::Idle;
+        self.invalidate_latest_token_usage(cx);
         cx.notify();
+    }
+
+    fn invalidate_latest_token_usage(&mut self, cx: &mut Context<Self>) {
+        let old_usage = self.latest_token_usage();
+        if let Some(last_user_message_id) = self.last_user_message().map(|message| message.id.clone()) {
+            self.request_token_usage.remove(&last_user_message_id);
+        }
+        let new_usage = self.latest_token_usage();
+        if old_usage != new_usage {
+            cx.emit(TokenUsageUpdated(new_usage));
+        }
     }
 
     fn apply_ready_background_compaction(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1284,6 +1296,49 @@ impl Thread {
                 None
             }
         }
+    }
+
+    pub fn compact_now(
+        &mut self,
+        source: crate::CompactionSource,
+        custom_instructions: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.apply_ready_background_compaction(cx) {
+            return Task::ready(Ok(()));
+        }
+
+        let task = match (&self.background_summarizer, &custom_instructions) {
+            (BackgroundSummarizerState::InProgress { task, .. }, None) => task.clone(),
+            (BackgroundSummarizerState::InProgress { .. }, Some(_)) => {
+                return Task::ready(Err(anyhow!(
+                    "Compaction is already in progress. Wait for it to finish before retrying with instructions."
+                )));
+            }
+            _ => {
+                let summarize_through_ix = self
+                    .select_summarization_point()
+                    .ok_or_else(|| anyhow!("Not enough thread history to compact yet."));
+                let Ok(summarize_through_ix) = summarize_through_ix else {
+                    return Task::ready(summarize_through_ix.map(|_| ()));
+                };
+                self.run_compaction(summarize_through_ix, source, custom_instructions, cx)
+            }
+        };
+
+        cx.spawn(async move |this, cx| {
+            task.await;
+            this.update(cx, |this, cx| {
+                if this.apply_ready_background_compaction(cx) {
+                    Ok(())
+                } else if let BackgroundSummarizerState::Failed { error } = &this.background_summarizer {
+                    Err(anyhow!(error.clone()))
+                } else {
+                    Err(anyhow!("Compaction did not produce a summary."))
+                }
+            })??;
+            Ok(())
+        })
     }
 
     pub(crate) fn run_compaction(
@@ -5055,6 +5110,73 @@ mod tests {
                     crate::CompactionSource::Foreground
                 ));
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compact_now_applies_summary_and_clears_latest_token_usage(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let fake_model = Arc::new(FakeLanguageModel::default());
+        let model: Arc<dyn LanguageModel> = fake_model.clone();
+        let latest_user_message_id = UserMessageId::new();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.messages = vec![
+                    Message::User(UserMessage {
+                        id: UserMessageId::new(),
+                        content: vec![UserMessageContent::Text("old question".into())],
+                    }),
+                    Message::Agent(AgentMessage {
+                        content: vec![AgentMessageContent::Text("old answer".into())],
+                        ..Default::default()
+                    }),
+                    Message::User(UserMessage {
+                        id: latest_user_message_id.clone(),
+                        content: vec![UserMessageContent::Text("latest question".into())],
+                    }),
+                ];
+                thread.set_model(model, cx);
+                thread.request_token_usage.insert(
+                    latest_user_message_id.clone(),
+                    TokenUsage {
+                        input_tokens: 900,
+                        output_tokens: 100,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            assert!(thread.read(cx).latest_token_usage().is_some());
+        });
+
+        let task = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.compact_now(crate::CompactionSource::Manual, None, cx)
+            })
+        });
+
+        cx.run_until_parked();
+        let request = fake_model
+            .pending_completions()
+            .pop()
+            .expect("compaction request should be pending");
+        fake_model.send_completion_stream_text_chunk(&request, "<summary>Manual summary</summary>");
+        fake_model.end_completion_stream(&request);
+
+        task.await.unwrap();
+
+        cx.update(|cx| {
+            let thread = thread.read(cx);
+            let compaction = thread.compaction.as_ref().expect("compaction should be applied");
+            assert_eq!(compaction.summary, "Manual summary");
+            assert_eq!(compaction.compacted_through_ix, 1);
+            assert!(thread.latest_token_usage().is_none());
         });
     }
                         assert_eq!(tool_use.id, tool_use_id);

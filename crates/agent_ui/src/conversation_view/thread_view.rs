@@ -8731,7 +8731,7 @@ impl ThreadView {
                 Severity::Error,
                 IconName::XCircle,
                 "Thread reached the token limit",
-                "Start a new thread from a summary to continue.",
+                "Compact this thread to continue.",
             )
         } else {
             match usage_level {
@@ -8740,13 +8740,13 @@ impl ThreadView {
                     Severity::Warning,
                     IconName::Warning,
                     "Thread reaching the token limit soon",
-                    "Quality may decline as the context window fills. Start a new thread from a summary before the limit is reached.",
+                    "Quality may decline as the context window fills. Compact this thread before the limit is reached.",
                 ),
                 ContextUsageLevel::Critical => (
                     Severity::Error,
                     IconName::Warning,
                     "Thread is very close to the token limit",
-                    "Start a new thread from a summary to continue reliably.",
+                    "Compact this thread to continue reliably.",
                 ),
             }
         };
@@ -8759,22 +8759,41 @@ impl ThreadView {
                 .description(description)
                 .actions_slot(
                     h_flex().gap_0p5().child(
-                        Button::new("start-new-thread", "Start New Thread")
+                        Button::new("compact-thread", "Compact Thread")
                             .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let session_id = this.thread.read(cx).session_id().clone();
-                                window.dispatch_action(
-                                    crate::NewNativeAgentThreadFromSummary {
-                                        from_session_id: session_id,
-                                    }
-                                    .boxed_clone(),
-                                    cx,
-                                );
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.compact_current_thread(cx);
                             })),
                     ),
                 )
                 .dismiss_action(self.dismiss_error_button(cx)),
         )
+    }
+
+    fn compact_current_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+
+        self.thread_error.take();
+
+        let task = thread.update(cx, |thread, cx| {
+            thread.compact_now(agent::CompactionSource::Manual, None, cx)
+        });
+
+        cx.emit(AcpThreadViewEvent::Interacted);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+
+            this.update(cx, |this, cx| {
+                if let Err(err) = result {
+                    this.handle_thread_error(err, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_permission_dropdown(

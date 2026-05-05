@@ -1631,19 +1631,18 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                 } else {
                     Some(parsed_command.arg_value.trim().to_string())
                 };
-                if let Some(thread) = self.thread(&session_id, cx) {
-                    let _ = thread.update(cx, |thread, cx| {
-                        if let Some(ix) = thread.select_summarization_point() {
-                            let _ = thread.run_compaction(
-                                ix,
-                                crate::CompactionSource::Manual,
-                                instructions,
-                                cx,
-                            );
-                        }
-                    });
-                }
-                return Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)));
+                let Some(thread) = self.thread(&session_id, cx) else {
+                    return Task::ready(Err(anyhow!("Session thread not found")));
+                };
+
+                let task = thread.update(cx, |thread, cx| {
+                    thread.compact_now(crate::CompactionSource::Manual, instructions, cx)
+                });
+
+                return cx.spawn(async move |_cx| {
+                    task.await?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                });
             }
 
             let registry = project_state.context_server_registry.read(cx);
