@@ -36,12 +36,12 @@ use heck::ToSnakeCase as _;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool, MessageContent,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
     LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, Speed, StopReason,
     TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
-use project::Project;
+use project::{Project, ProjectPath};
 use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
@@ -59,12 +59,15 @@ use std::{
     time::{Duration, Instant},
 };
 use std::{fmt::Write, path::PathBuf};
-use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
+use util::{
+    ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle, rel_path::RelPath,
+};
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+const COMPACTION_TRANSCRIPTS_DIR: &str = "compaction-transcripts";
 
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
@@ -965,6 +968,8 @@ pub struct SummarizationThresholds {
     pub emergency: f64,
 }
 
+const ESTIMATED_BYTES_PER_TOKEN: usize = 3;
+
 impl Default for SummarizationThresholds {
     fn default() -> Self {
         Self {
@@ -996,6 +1001,113 @@ fn extract_summary(response: &str) -> String {
         return response[start + "<summary>".len()..end].trim().to_string();
     }
     response.trim().to_string()
+}
+
+fn render_markdown_history(messages: &[Message]) -> String {
+    let mut markdown = String::new();
+    for (ix, message) in messages.iter().enumerate() {
+        if ix > 0 {
+            markdown.push('\n');
+        }
+        match message {
+            Message::User(_) => markdown.push_str("## User\n\n"),
+            Message::Agent(_) => markdown.push_str("## Assistant\n\n"),
+            Message::Resume => {}
+        }
+        markdown.push_str(&message.to_markdown());
+    }
+    markdown
+}
+
+struct CompactionTranscriptSnapshot {
+    absolute_path: PathBuf,
+    tool_path: String,
+    line_count: usize,
+}
+
+fn append_compaction_transcript_hint(
+    mut summary: String,
+    snapshot: &CompactionTranscriptSnapshot,
+) -> String {
+    summary.push_str(&format!(
+        "\nIf you need specific details from the compacted portion of the conversation (such as exact code snippets, error messages, tool results, or generated content), use the {} tool with path \"{}\".",
+        ReadFileTool::NAME,
+        snapshot.tool_path,
+    ));
+    summary.push_str(&format!(
+        "\nAt the time this snapshot was created, the transcript had {} lines.",
+        snapshot.line_count,
+    ));
+    summary
+}
+
+async fn persist_compaction_transcript_snapshot(
+    fs: Arc<dyn Fs>,
+    snapshot: CompactionTranscriptSnapshot,
+    content: String,
+) -> Option<CompactionTranscriptSnapshot> {
+    let Some(parent) = snapshot.absolute_path.parent() else {
+        return None;
+    };
+
+    if let Err(error) = fs.create_dir(parent).await {
+        log::warn!(
+            "Failed to create compaction transcript directory {}: {}",
+            parent.display(),
+            error,
+        );
+        return None;
+    }
+
+    if let Err(error) = fs.atomic_write(snapshot.absolute_path.clone(), content).await {
+        log::warn!(
+            "Failed to write compaction transcript snapshot {}: {}",
+            snapshot.absolute_path.display(),
+            error,
+        );
+        return None;
+    }
+
+    Some(snapshot)
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        0
+    } else {
+        text.len().div_ceil(ESTIMATED_BYTES_PER_TOKEN) as u64
+    }
+}
+
+fn estimate_message_content_tokens(content: &MessageContent) -> u64 {
+    match content {
+        MessageContent::Text(text)
+        | MessageContent::Thinking { text, .. }
+        | MessageContent::RedactedThinking(text) => estimate_text_tokens(text),
+        MessageContent::Image(image) => image.estimate_tokens() as u64,
+        MessageContent::ToolUse(tool_use) => {
+            estimate_text_tokens(tool_use.name.as_ref()) + estimate_text_tokens(&tool_use.raw_input)
+        }
+        MessageContent::ToolResult(tool_result) => {
+            let text_tokens = tool_result
+                .content
+                .iter()
+                .map(|content| match content {
+                    LanguageModelToolResultContent::Text(text) => estimate_text_tokens(text),
+                    LanguageModelToolResultContent::Image(image) => image.estimate_tokens() as u64,
+                })
+                .sum::<u64>();
+            estimate_text_tokens(tool_result.tool_name.as_ref()) + text_tokens
+        }
+    }
+}
+
+fn estimate_request_message_tokens(message: &LanguageModelRequestMessage) -> u64 {
+    message
+        .content
+        .iter()
+        .map(estimate_message_content_tokens)
+        .sum()
 }
 
 fn render_text_history(messages: &[Message]) -> String {
@@ -1091,6 +1203,7 @@ pub struct Thread {
     running_subagents: Vec<WeakEntity<Thread>>,
     /// Active compaction state — older messages replaced by summary when Some
     compaction: Option<crate::CompactionState>,
+    estimated_compaction_token_usage: Option<language_model::TokenUsage>,
     background_summarizer: BackgroundSummarizerState,
     summarization_thresholds: SummarizationThresholds,
 }
@@ -1215,6 +1328,7 @@ impl Thread {
             ui_scroll_position: None,
             running_subagents: Vec::new(),
             compaction: None,
+            estimated_compaction_token_usage: None,
             background_summarizer: BackgroundSummarizerState::Idle,
             summarization_thresholds: SummarizationThresholds::default(),
         }
@@ -1254,7 +1368,16 @@ impl Thread {
     }
 
     pub fn apply_compaction(&mut self, state: crate::CompactionState, cx: &mut Context<Self>) {
+        log::info!(
+            "Applied {:?} compaction for thread {} through message {} ({} messages summarized, summary_chars={})",
+            state.metadata.source,
+            self.id,
+            state.compacted_through_ix,
+            state.metadata.num_messages_summarized,
+            state.summary.chars().count()
+        );
         self.compaction = Some(state);
+        self.estimated_compaction_token_usage = self.estimate_compaction_token_usage(cx);
         self.background_summarizer = BackgroundSummarizerState::Idle;
         self.invalidate_latest_token_usage(cx);
         cx.notify();
@@ -1269,6 +1392,66 @@ impl Thread {
         if old_usage != new_usage {
             cx.emit(TokenUsageUpdated(new_usage));
         }
+    }
+
+    fn estimate_compaction_token_usage(&self, cx: &App) -> Option<language_model::TokenUsage> {
+        self.compaction.as_ref()?;
+        self.model.as_ref()?;
+
+        let request_messages = self.build_request_messages(Vec::new(), cx);
+        let input_tokens = request_messages
+            .iter()
+            .map(estimate_request_message_tokens)
+            .sum();
+
+        Some(language_model::TokenUsage {
+            input_tokens,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        })
+    }
+
+    fn prepare_compaction_transcript_snapshot(
+        &self,
+        messages: &[Message],
+        cx: &App,
+    ) -> Option<(CompactionTranscriptSnapshot, String)> {
+        if messages.is_empty() {
+            return None;
+        }
+
+        let project = self.project.read(cx);
+        let worktree = project
+            .visible_worktrees(cx)
+            .find(|worktree| !worktree.read(cx).is_single_file())
+            .or_else(|| project.visible_worktrees(cx).next())?;
+        let worktree = worktree.read(cx);
+        let workspace_root = if worktree.is_single_file() {
+            worktree.abs_path().parent()?.to_path_buf()
+        } else {
+            worktree.abs_path().to_path_buf()
+        };
+
+        let relative_path = PathBuf::from(".zed")
+            .join(COMPACTION_TRANSCRIPTS_DIR)
+            .join(format!("{}-{}.md", self.id, Uuid::new_v4()));
+        let rel_path = RelPath::new(relative_path.as_path(), project.path_style(cx)).ok()?;
+        let project_path = ProjectPath {
+            worktree_id: worktree.id(),
+            path: rel_path.into_arc(),
+        };
+        let tool_path = project.short_full_path_for_project_path(&project_path, cx)?;
+        let content = render_markdown_history(messages);
+
+        Some((
+            CompactionTranscriptSnapshot {
+                absolute_path: workspace_root.join(project_path.path.as_std_path()),
+                tool_path,
+                line_count: content.lines().count(),
+            },
+            content,
+        ))
     }
 
     fn apply_ready_background_compaction(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1305,12 +1488,38 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         if self.apply_ready_background_compaction(cx) {
+            log::info!(
+                "Compaction request for thread {} reused a ready summary (requested source={:?})",
+                self.id,
+                source
+            );
+            if matches!(source, crate::CompactionSource::Manual) {
+                let num_messages_summarized = self
+                    .compaction
+                    .as_ref()
+                    .map(|compaction| compaction.metadata.num_messages_summarized)
+                    .unwrap_or_default();
+                cx.emit(ManualCompactionCompleted {
+                    num_messages_summarized,
+                });
+            }
             return Task::ready(Ok(()));
         }
 
         let task = match (&self.background_summarizer, &custom_instructions) {
-            (BackgroundSummarizerState::InProgress { task, .. }, None) => task.clone(),
+            (BackgroundSummarizerState::InProgress { task, .. }, None) => {
+                log::info!(
+                    "Compaction already in progress for thread {}; waiting for the existing summary task (requested source={:?})",
+                    self.id,
+                    source
+                );
+                task.clone()
+            }
             (BackgroundSummarizerState::InProgress { .. }, Some(_)) => {
+                log::info!(
+                    "Rejecting compaction request for thread {} because a compaction is already in progress and new instructions were provided",
+                    self.id
+                );
                 return Task::ready(Err(anyhow!(
                     "Compaction is already in progress. Wait for it to finish before retrying with instructions."
                 )));
@@ -1320,20 +1529,53 @@ impl Thread {
                     .select_summarization_point()
                     .ok_or_else(|| anyhow!("Not enough thread history to compact yet."));
                 let Ok(summarize_through_ix) = summarize_through_ix else {
+                    if matches!(source, crate::CompactionSource::Manual) {
+                        log::info!(
+                            "Skipping manual compaction for thread {} because there is not enough history to summarize",
+                            self.id
+                        );
+                    }
                     return Task::ready(summarize_through_ix.map(|_| ()));
                 };
+                log::info!(
+                    "Preparing {:?} compaction for thread {} through message {}",
+                    source,
+                    self.id,
+                    summarize_through_ix
+                );
                 self.run_compaction(summarize_through_ix, source, custom_instructions, cx)
             }
         };
+
+        let emit_manual_events = matches!(source, crate::CompactionSource::Manual);
+        let thread_id = self.id.clone();
+        if emit_manual_events {
+            cx.emit(ManualCompactionStarted);
+        }
 
         cx.spawn(async move |this, cx| {
             task.await;
             this.update(cx, |this, cx| {
                 if this.apply_ready_background_compaction(cx) {
+                    if emit_manual_events {
+                        let num_messages_summarized = this
+                            .compaction
+                            .as_ref()
+                            .map(|compaction| compaction.metadata.num_messages_summarized)
+                            .unwrap_or_default();
+                        cx.emit(ManualCompactionCompleted {
+                            num_messages_summarized,
+                        });
+                    }
                     Ok(())
                 } else if let BackgroundSummarizerState::Failed { error } = &this.background_summarizer {
+                    log::warn!("Compaction task for thread {} failed: {}", thread_id, error);
                     Err(anyhow!(error.clone()))
                 } else {
+                    log::warn!(
+                        "Compaction task for thread {} finished without producing a summary",
+                        thread_id
+                    );
                     Err(anyhow!("Compaction did not produce a summary."))
                 }
             })??;
@@ -1353,16 +1595,39 @@ impl Thread {
             .clone()
             .or_else(|| self.model.clone());
         let Some(model) = model else {
+            log::info!(
+                "Skipping {:?} compaction for thread {} because no summarization model is configured",
+                source,
+                self.id
+            );
             return Task::ready(None).shared();
         };
 
         if self.messages.is_empty() {
+            log::info!(
+                "Skipping {:?} compaction for thread {} because the thread has no messages",
+                source,
+                self.id
+            );
             return Task::ready(None).shared();
         }
 
         let bounded_ix = summarize_through_ix.min(self.messages.len().saturating_sub(1));
         let messages_snapshot: Vec<Message> = self.messages[..=bounded_ix].to_vec();
         let num_messages = messages_snapshot.len();
+        let has_custom_instructions = custom_instructions.is_some();
+        let thread_id = self.id.clone();
+        let fs = self.project.read(cx).fs().clone();
+        let transcript_snapshot = self.prepare_compaction_transcript_snapshot(&messages_snapshot, cx);
+
+        log::info!(
+            "Starting {:?} compaction request for thread {} through message {} (snapshot_messages={}, custom_instructions={})",
+            source,
+            thread_id,
+            bounded_ix,
+            num_messages,
+            has_custom_instructions
+        );
 
         let mut system_prompt = COMPACT_CONTEXT_PROMPT.to_string();
         if let Some(instructions) = custom_instructions {
@@ -1386,17 +1651,25 @@ impl Thread {
                     reasoning_details: None,
                 },
             ],
-            temperature: AgentSettings::temperature_for_model(&model, cx),
+            // Keep compaction summaries stable so repeated compactions preserve
+            // the same core facts instead of drifting with user-tuned sampling.
+            temperature: Some(0.0),
             ..Default::default()
         };
 
         let task = cx
             .spawn(async move |this, cx| {
+                let transcript_snapshot = if let Some((snapshot, content)) = transcript_snapshot {
+                    persist_compaction_transcript_snapshot(fs.clone(), snapshot, content).await
+                } else {
+                    None
+                };
+
                 let stream = model.stream_completion(request, cx).await;
                 let mut stream = match stream {
                     Ok(s) => s,
                     Err(e) => {
-                        log::warn!("Compaction failed: {e}");
+                        log::warn!("Compaction failed for thread {}: {e}", thread_id);
                         this.update(cx, |this, _| {
                             this.background_summarizer = BackgroundSummarizerState::Failed {
                                 error: e.to_string(),
@@ -1415,13 +1688,31 @@ impl Thread {
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            log::warn!("Compaction stream error: {e}");
+                            log::warn!("Compaction stream error for thread {}: {e}", thread_id);
                             break;
                         }
                     }
                 }
 
                 let summary = extract_summary(&response);
+                let summary = if let Some(snapshot) = transcript_snapshot.as_ref() {
+                    append_compaction_transcript_hint(summary, snapshot)
+                } else {
+                    summary
+                };
+                if summary.is_empty() {
+                    log::warn!(
+                        "Compaction request for thread {} completed with an empty summary",
+                        thread_id
+                    );
+                } else {
+                    log::info!(
+                        "Compaction request for thread {} completed (source={:?}, summary_chars={})",
+                        thread_id,
+                        source,
+                        summary.chars().count()
+                    );
+                }
                 this.update(cx, |this, cx| {
                     this.background_summarizer = BackgroundSummarizerState::Completed {
                         summary: summary.clone(),
@@ -1665,6 +1956,7 @@ impl Thread {
             }),
             running_subagents: Vec::new(),
             compaction: db_thread.compaction,
+            estimated_compaction_token_usage: None,
             background_summarizer: BackgroundSummarizerState::Idle,
             summarization_thresholds: SummarizationThresholds::default(),
         }
@@ -1762,6 +2054,7 @@ impl Thread {
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
         self.model = Some(model.clone());
+        self.estimated_compaction_token_usage = self.estimate_compaction_token_usage(cx);
         let new_caps = Self::prompt_capabilities(self.model.as_deref());
         let new_usage = self.latest_token_usage();
         if old_usage != new_usage {
@@ -1990,12 +2283,13 @@ impl Thread {
     }
 
     fn update_token_usage(&mut self, update: language_model::TokenUsage, cx: &mut Context<Self>) {
-        let Some(last_user_message) = self.last_user_message() else {
+        let Some(last_user_message_id) = self.last_user_message().map(|message| message.id.clone()) else {
             return;
         };
 
+        self.estimated_compaction_token_usage = None;
         self.request_token_usage
-            .insert(last_user_message.id.clone(), update);
+            .insert(last_user_message_id, update);
         cx.emit(TokenUsageUpdated(self.latest_token_usage()));
         cx.notify();
     }
@@ -2019,6 +2313,7 @@ impl Thread {
                 Message::Agent(_) | Message::Resume => {}
             }
         }
+        self.estimated_compaction_token_usage = None;
         self.clear_summary();
         cx.notify();
         Ok(())
@@ -2031,7 +2326,9 @@ impl Thread {
     }
 
     pub fn latest_token_usage(&self) -> Option<acp_thread::TokenUsage> {
-        let usage = self.latest_request_token_usage()?;
+        let usage = self
+            .latest_request_token_usage()
+            .or(self.estimated_compaction_token_usage)?;
         let model = self.model.clone()?;
         Some(acp_thread::TokenUsage {
             max_tokens: model.max_token_count(),
@@ -2646,6 +2943,13 @@ impl Thread {
                             if should_compact(ratio, true, &self.summarization_thresholds)
                                 && let Some(ix) = self.select_summarization_point()
                             {
+                                log::info!(
+                                    "Background compaction triggered for thread {} at {:.1}% of input budget ({} / {})",
+                                    self.id,
+                                    ratio * 100.0,
+                                    usage.input_tokens,
+                                    budget
+                                );
                                 let _ = self.run_compaction(
                                     ix,
                                     crate::CompactionSource::Background,
@@ -3445,18 +3749,7 @@ impl Thread {
     }
 
     pub fn to_markdown(&self) -> String {
-        let mut markdown = String::new();
-        for (ix, message) in self.messages.iter().enumerate() {
-            if ix > 0 {
-                markdown.push('\n');
-            }
-            match message {
-                Message::User(_) => markdown.push_str("## User\n\n"),
-                Message::Agent(_) => markdown.push_str("## Assistant\n\n"),
-                Message::Resume => {}
-            }
-            markdown.push_str(&message.to_markdown());
-        }
+        let mut markdown = render_markdown_history(&self.messages);
 
         if let Some(message) = self.pending_message.as_ref() {
             markdown.push_str("\n## Assistant\n\n");
@@ -3606,6 +3899,18 @@ impl RunningTurn {
 pub struct TokenUsageUpdated(pub Option<acp_thread::TokenUsage>);
 
 impl EventEmitter<TokenUsageUpdated> for Thread {}
+
+#[derive(Clone, Debug)]
+pub struct ManualCompactionStarted;
+
+impl EventEmitter<ManualCompactionStarted> for Thread {}
+
+#[derive(Clone, Debug)]
+pub struct ManualCompactionCompleted {
+    pub num_messages_summarized: usize,
+}
+
+impl EventEmitter<ManualCompactionCompleted> for Thread {}
 
 pub struct TitleUpdated;
 
@@ -5092,7 +5397,7 @@ mod tests {
             .pending_completions()
             .pop()
             .expect("compaction request should be pending");
-        assert_eq!(request.temperature, None);
+        assert_eq!(request.temperature, Some(0.0));
         fake_model.send_completion_stream_text_chunk(&request, "<summary>Foreground summary</summary>");
         fake_model.end_completion_stream(&request);
 
@@ -5112,6 +5417,77 @@ mod tests {
                 ));
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_run_compaction_persists_transcript_snapshot_and_appends_hint(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let fake_model = Arc::new(FakeLanguageModel::default());
+        let model: Arc<dyn LanguageModel> = fake_model.clone();
+        let project = cx.update(|cx| thread.read(cx).project.clone());
+        let fs = cx.update(|cx| project.read(cx).fs().clone());
+
+        project
+            .update(cx, |project, cx| project.create_worktree("/root", true, cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.messages = vec![
+                    Message::User(UserMessage {
+                        id: UserMessageId::new(),
+                        content: vec![UserMessageContent::Text("old question".into())],
+                    }),
+                    Message::Agent(AgentMessage {
+                        content: vec![AgentMessageContent::Text("old answer".into())],
+                        ..Default::default()
+                    }),
+                ];
+                thread.set_model(model, cx);
+            });
+        });
+
+        let task = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.run_compaction(1, crate::CompactionSource::Foreground, None, cx)
+            })
+        });
+
+        cx.run_until_parked();
+        let request = fake_model
+            .pending_completions()
+            .pop()
+            .expect("compaction request should be pending");
+        fake_model.send_completion_stream_text_chunk(&request, "<summary>Foreground summary</summary>");
+        fake_model.end_completion_stream(&request);
+
+        let summary = task
+            .await
+            .expect("summary should be returned")
+            .to_string();
+        assert!(summary.contains(ReadFileTool::NAME));
+        assert!(summary.contains(".zed/compaction-transcripts/"));
+        assert!(summary.contains("transcript had"));
+
+        let path_start = summary.find('"').expect("summary should contain a quoted path") + 1;
+        let path_end = summary[path_start..]
+            .find('"')
+            .map(|offset| path_start + offset)
+            .expect("summary should close the quoted path");
+        let tool_path = &summary[path_start..path_end];
+
+        let snapshot = fs
+            .load(Path::new("/root").join(tool_path).as_path())
+            .await
+            .expect("snapshot should be written to disk");
+        assert!(snapshot.contains("## User"));
+        assert!(snapshot.contains("old question"));
+        assert!(snapshot.contains("## Assistant"));
+        assert!(snapshot.contains("old answer"));
     }
 
     #[gpui::test]
@@ -5177,7 +5553,11 @@ mod tests {
             let compaction = thread.compaction.as_ref().expect("compaction should be applied");
             assert_eq!(compaction.summary, "Manual summary");
             assert_eq!(compaction.compacted_through_ix, 1);
-            assert!(thread.latest_token_usage().is_none());
+            let usage = thread
+                .latest_token_usage()
+                .expect("compaction should keep an estimated token usage available");
+            assert!(usage.used_tokens > 0);
+            assert_eq!(usage.output_tokens, 0);
         });
     }
                         assert_eq!(tool_use.id, tool_use_id);

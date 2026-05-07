@@ -18,6 +18,7 @@ use crate::message_editor::SharedSessionCapabilities;
 use gpui::List;
 use heapless::Vec as ArrayVec;
 use language_model::{LanguageModelEffortLevel, Speed};
+use notifications::status_toast::StatusToast;
 use settings::{SidebarSide, update_settings_file};
 use ui::{ButtonLike, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle, Tab};
 use workspace::SERIALIZATION_THROTTLE_TIME;
@@ -557,6 +558,24 @@ impl ThreadView {
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
         };
+
+        if let Some(native_thread) = this.as_native_thread(cx) {
+            this._subscriptions.push(cx.subscribe(
+                &native_thread,
+                |this, _thread, _: &agent::ManualCompactionStarted, cx| {
+                    this.show_manual_compaction_started_toast(cx);
+                },
+            ));
+            this._subscriptions.push(cx.subscribe(
+                &native_thread,
+                |this, _thread, event: &agent::ManualCompactionCompleted, cx| {
+                    this.show_manual_compaction_completed_toast(
+                        event.num_messages_summarized,
+                        cx,
+                    );
+                },
+            ));
+        }
 
         this.sync_generating_indicator(cx);
         this.sync_editor_mode_for_empty_state(cx);
@@ -2072,6 +2091,47 @@ impl ThreadView {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn show_manual_compaction_started_toast(&self, cx: &mut Context<Self>) {
+        let status_toast = StatusToast::new("Compacting thread...", cx, |this, _cx| {
+            this.icon(
+                Icon::new(IconName::ArrowCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+        });
+
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_status_toast(status_toast, cx);
+            })
+            .log_err();
+    }
+
+    fn show_manual_compaction_completed_toast(
+        &self,
+        num_messages_summarized: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let message = if num_messages_summarized > 0 {
+            format!("Compacted {num_messages_summarized} earlier messages.")
+        } else {
+            "Compacted thread.".to_string()
+        };
+        let status_toast = StatusToast::new(message, cx, |this, _cx| {
+            this.icon(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Success),
+            )
+        });
+
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_status_toast(status_toast, cx);
+            })
+            .log_err();
     }
 
     pub fn restore_checkpoint(&mut self, message_id: &UserMessageId, cx: &mut Context<Self>) {
